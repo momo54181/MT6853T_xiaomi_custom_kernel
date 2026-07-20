@@ -107,6 +107,10 @@ struct mt6360_pmu_chg_info {
 	struct workqueue_struct *pe_wq;
 	struct work_struct pe_work;
 	u8 ctd_dischg_status;
+
+	/* QC fast charge support */
+	bool support_hvdcp;
+	struct delayed_work qc_work;
 };
 
 /* for recive bat oc notify */
@@ -544,6 +548,90 @@ static int mt6360_enable_usbchgen(struct mt6360_pmu_chg_info *mpci, bool en)
 	return ret;
 }
 
+/* ==================== */
+/* QC Fast Charge       */
+/* ==================== */
+static int mt6360_get_vbus(struct charger_device *chg_dev, u32 *vbus);
+
+static void mt6360_qc_work(struct work_struct *work)
+{
+	struct mt6360_pmu_chg_info *mpci =
+		container_of(work, struct mt6360_pmu_chg_info, qc_work.work);
+	u32 vbus_before = 0, vbus_after = 0;
+	u8 orig_dpdm;
+	int ret, i;
+
+	if (!mpci || !mpci->chg_dev)
+		return;
+
+	orig_dpdm = (u8)mt6360_pmu_reg_read(mpci->mpi, MT6360_PMU_DPDM_CTRL);
+	mt6360_get_vbus(mpci->chg_dev, &vbus_before);
+	dev_info(mpci->dev, "QC: VBUS before=%duV, 0x28=0x%02X\n",
+		 vbus_before, orig_dpdm);
+
+	/* Step 1: reset HVDCP state machine */
+	mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_HVDCP_DEVICE_TYPE, 0x00);
+	mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_DPDM_CTRL, 0x00);
+	mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_CHG_PUMP, 0x00);
+	msleep(100);
+
+	/* Step 2: enable HVDCP detection via 0x23 bit7 */
+	mt6360_pmu_reg_update_bits(mpci->mpi, MT6360_PMU_HVDCP_DEVICE_TYPE,
+				   MT6360_MASK_HVDCP_DET_EN,
+				   MT6360_MASK_HVDCP_DET_EN);
+	/* retry BC1.2 */
+	__mt6360_enable_usbchgen(mpci, false);
+	__mt6360_enable_usbchgen(mpci, true);
+
+	/* wait for HVDCP detection */
+	for (i = 0; i < 30; i++) {
+		msleep(100);
+		ret = mt6360_pmu_reg_read(mpci->mpi, MT6360_PMU_DEVICE_TYPE);
+		if (ret & MT6360_MASK_HVDCP_DET) {
+			dev_info(mpci->dev, "QC: HVDCP detected at step %d\n", i);
+			break;
+		}
+	}
+
+	if (!(ret & MT6360_MASK_HVDCP_DET)) {
+		dev_info(mpci->dev, "QC: HVDCP not detected, trying direct 0x28\n");
+	}
+
+	/* Step 3: read VBUS after HVDCP detection */
+	mt6360_get_vbus(mpci->chg_dev, &vbus_before);
+	dev_info(mpci->dev, "QC: VBUS after HVDCP detect=%duV\n", vbus_before);
+
+	/* Step 4: try 0x28=0x16 (12V) */
+	mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_DPDM_CTRL, MT6360_QC_12V);
+	for (i = 0; i < 15; i++) {
+		msleep(100);
+		mt6360_get_vbus(mpci->chg_dev, &vbus_after);
+		if (vbus_after > vbus_before + 500000) {
+			dev_info(mpci->dev, "QC: 12V OK, VBUS=%duV (step=%d)\n",
+				 vbus_after, i);
+			return;
+		}
+	}
+	dev_info(mpci->dev, "QC: 12V timeout, VBUS=%duV\n", vbus_after);
+
+	/* Step 5: try 0x28=0x18 (9V) */
+	mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_DPDM_CTRL, MT6360_QC_9V);
+	for (i = 0; i < 15; i++) {
+		msleep(100);
+		mt6360_get_vbus(mpci->chg_dev, &vbus_after);
+		if (vbus_after > vbus_before + 500000) {
+			dev_info(mpci->dev, "QC: 9V OK, VBUS=%duV (step=%d)\n",
+				 vbus_after, i);
+			return;
+		}
+	}
+	dev_info(mpci->dev, "QC: 9V timeout, VBUS=%duV\n", vbus_after);
+
+	/* not QC, restore original 0x28 */
+	mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_DPDM_CTRL, orig_dpdm);
+	dev_info(mpci->dev, "QC: not supported, 0x28 restored to 0x%02X\n", orig_dpdm);
+}
+
 #ifdef CONFIG_MT6360_PMU_CHARGER_TYPE_DETECT
 static int mt6360_chgdet_pre_process(struct mt6360_pmu_chg_info *mpci)
 {
@@ -555,6 +643,11 @@ static int mt6360_chgdet_pre_process(struct mt6360_pmu_chg_info *mpci)
 #else
 	attach = mpci->pwr_rdy;
 #endif /* CONFIG_TCPC_CLASS */
+
+	/* reset HVDCP state before BC1.2 (like OPLUS) */
+	mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_HVDCP_DEVICE_TYPE, 0x00);
+	mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_DPDM_CTRL, 0x00);
+
 	if (attach && is_meta_mode()) {
 		/* Skip charger type detection to speed up meta boot.*/
 		dev_notice(mpci->dev, "%s: force Standard USB Host in meta\n",
@@ -592,8 +685,17 @@ static int mt6360_chgdet_post_process(struct mt6360_pmu_chg_info *mpci)
 	/* Plug out during BC12 */
 	if (!attach) {
 		mpci->chg_type = CHARGER_UNKNOWN;
+		cancel_delayed_work_sync(&mpci->qc_work);
+
+		/* reset HVDCP state */
+		mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_HVDCP_DEVICE_TYPE, 0x00);
+		mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_DPDM_CTRL, 0x00);
+		mt6360_pmu_reg_write(mpci->mpi, MT6360_PMU_CHG_PUMP, 0x00);
 		goto out;
 	}
+	/* Plug in - dump 0x28 state before BC1.2 */
+	dev_info(mpci->dev, "attach: 0x28=0x%02X before BC1.2\n",
+		 mt6360_pmu_reg_read(mpci->mpi, MT6360_PMU_DPDM_CTRL));
 	/* Plug in */
 	ret = mt6360_pmu_reg_read(mpci->mpi, MT6360_PMU_USB_STATUS1);
 	if (ret < 0)
@@ -615,10 +717,12 @@ static int mt6360_chgdet_post_process(struct mt6360_pmu_chg_info *mpci)
 		break;
 	case MT6360_CHG_TYPE_DCP:
 		mpci->chg_type = STANDARD_CHARGER;
+		schedule_delayed_work(&mpci->qc_work, msecs_to_jiffies(100));
 		break;
 	}
 out:
 	if (!attach) {
+		cancel_delayed_work_sync(&mpci->qc_work);
 		ret = __mt6360_enable_usbchgen(mpci, false);
 		if (ret < 0)
 			dev_notice(mpci->dev, "%s: disable chgdet fail\n",
@@ -2196,7 +2300,7 @@ static irqreturn_t mt6360_pmu_detachi_handler(int irq, void *data)
 static irqreturn_t mt6360_pmu_hvdcp_det_handler(int irq, void *data)
 {
 	struct mt6360_pmu_chg_info *mpci = data;
-      	int ret, i;
+	int ret, i;
 	dev_info(mpci->dev, "%s: HVDCP IRQ fired!\n", __func__);
 	/* Dump registers 0x20~0x2F to find HVDCP status bit */
 	for (i = 0x20; i <= 0x2F; i++) {
@@ -2855,6 +2959,10 @@ static int mt6360_pmu_chg_probe(struct platform_device *pdev)
 		goto err_shipping_mode_attr;
 	}
 	INIT_WORK(&mpci->pe_work, mt6360_trigger_pep_work_handler);
+
+	/* QC fast charge support */
+	INIT_DELAYED_WORK(&mpci->qc_work, mt6360_qc_work);
+	dev_info(mpci->dev, "QC fast charge support enabled\n");
 
 	/* register fg bat oc notify */
 	if (pdata->batoc_notify)
